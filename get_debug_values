@@ -1,0 +1,283 @@
+# https://lldb.llvm.org/python_api_enums.html#basictype
+import os
+import sys
+from utils import load_lldb_interface
+from typing import List
+# from get_line_nums import get_line_nums, load_lldb_interface
+
+class DebugValue:
+    MAX_DEPTH = 10  # Maximum depth for recursion
+    ERRORS = [
+        "variable not available",
+        "no location, value may have been optimized out",
+
+        
+    ]
+    def __init__(self, sbvalue, known_errors=ERRORS, depth=0):
+        self.KNOWN_ERRORS = known_errors # List of error messages that are known to be benign
+        self.sbvalue = sbvalue
+        self.name = sbvalue.GetName()
+        self.type = sbvalue.GetTypeName()
+        self.error_message = None
+        self.value = None
+        self.children = []
+        self.get_num_children = lambda: sbvalue.GetNumChildren()
+        self.is_pointer = lambda: sbvalue.GetType().IsPointerType()  #sbvalue.TypeIsPointerType()
+        self.is_array = lambda: sbvalue.GetType().IsArrayType()
+        self.is_struct = lambda: sbvalue.GetType().GetTypeClass() == 16384#lldb.eTypeClassStruct
+        self.is_union = lambda: sbvalue.GetType().GetTypeClass() == 65536#lldb.eTypeClassUnion
+        self.is_primitive = lambda: sbvalue.GetType().GetBasicType() != 0 #lldb.eBasicTypeInvalid 
+        self.depth = depth
+        self.pointer_chain = []
+
+        if self.sbvalue.GetError().Fail():
+            self.error_message = self.sbvalue.GetError().GetCString()
+        elif self.depth >= self.MAX_DEPTH:
+            self.error_message = f"Max recursion depth ({self.MAX_DEPTH}) reached"
+        else:
+            self._process_value()
+
+    def _process_value(self):
+        if self.is_pointer():
+            return  self._process_pointer()
+        elif self.is_array() or self.is_struct() or self.is_union():
+            return self._process_composite()
+        else:
+            self.value = self.sbvalue.GetValue()
+            return self.value
+
+    def _process_pointer(self):
+        pointer_depth = 0 # or define pointer_chain as a list to keep track of pointer depth
+        while self.is_pointer() and pointer_depth <= self.depth:
+            pointer_depth += 1
+            self.pointer_chain.append(self)
+            if self.sbvalue.GetValueAsUnsigned() == 0:
+                self.value = "NULL"
+                return f"NULL pointer (depth: {pointer_depth})"
+            try:
+                dereferenced = self.sbvalue.Dereference()
+                current_value = DebugValue(dereferenced, self.depth + 1)
+                if current_value.error_message:
+                    return  f"Error dereferencing pointer: {dereferenced.GetError().GetCString()}"
+            except Exception as e:
+                self.error_message = f"Unexpected error while dereferencing pointer: {str(e)}"
+                return f"Unexpected error while dereferencing pointer: {str(e)}"
+        # print(f"Pointer (depth: {pointer_depth}) to {current_value} ---{self.depth}")
+        # We've reached a non-pointer value, process it recursively
+        if not self.error_message and self.value != "NULL":
+            if current_value.error_message:
+                self.error_message = current_value.error_message
+                return self.error_message
+            else:
+                return current_value
+
+    def _process_composite(self):
+        if self.get_num_children() > 0:
+            for i in range(self.get_num_children()):
+                child_sbvalue = self.sbvalue.GetChildAtIndex(i)
+                if child_sbvalue.GetName() is not None:
+                    child_debug_value = DebugValue(child_sbvalue, self.depth + 1)
+                    self.children.append(child_debug_value) 
+        else:
+            self.value = f"{(self.type)} : {self.name} has no children"
+
+    def __str__(self, indent=0):
+        indent_str = "  " * indent
+        if self.error_message:
+            return f"{indent_str}{self.name} (Error: {self.error_message})"
+        elif self.is_pointer():
+            return f"{indent_str}({self.type}) {self.name} : {self._process_value()}"
+        elif self.value is not None:
+            return f"{indent_str}{self.name} = {self.value}"
+        elif self.children:
+            child_str = ", ".join(str(child) for child in self.children)
+            return f"({self.type}) {self.name} = {{{child_str}}}"
+        else:
+            return f"{indent_str}({self.type}) {self.name} = {self.value}"
+
+    def compare(self, other):
+        if not isinstance(other, DebugValue):
+            return f"Cannot compare DebugValue with {type(other)}"
+
+        differences = []
+        if self.name != other.name:
+            differences.append(f"Name: {self.name} != {other.name}")
+        if self.type != other.type:
+            differences.append(f"Type: {self.type} != {other.type}")
+        if self.error_message != other.error_message:
+            differences.append(f"Error: {self.error_message} != {other.error_message}")
+        if self.value != other.value:
+            differences.append(f"Value: {self.value} != {other.value}")
+        if len(self.pointer_chain) != len(other.pointer_chain):
+            differences.append(f"Pointer chain length: {len(self.pointer_chain)} != {len(other.pointer_chain)}")
+        else:
+            for i, (self_ptr, other_ptr) in enumerate(zip(self.pointer_chain, other.pointer_chain)):
+                if self_ptr.type != other_ptr.type:
+                    differences.append(f"Pointer chain element {i}: {self_ptr.type} != {other_ptr.type}")
+        
+        if differences:
+            return  "\n".join(differences)
+
+    # def __repr__(self):
+    #     return self.__str__()
+    # def __str__(self):
+    #     return self.sbvalue.__str__()
+    
+    def get_value(self):
+        if self.depth >= self.MAX_DEPTH:
+            return f"Max recursion depth ({self.MAX_DEPTH}) reached"
+        
+        if self.sbvalue.GetError().Fail():
+            return f"Error: {self.sbvalue.GetError().GetCString()}"    
+
+        if self.is_pointer():
+            return self._get_pointer_value()
+        elif self.is_array() or self.is_struct() or self.is_union():
+            return self._get_composite_value()
+        else:
+            return self.sbvalue.GetValue()
+        
+    def _get_pointer_value(self):
+        pointer_depth = 0
+        current_value = self
+        while current_value.is_pointer() and pointer_depth < self.MAX_DEPTH:
+            pointer_depth += 1
+            if self.sbvalue.GetValueAsUnsigned() == 0:
+                return f"NULL pointer (depth: {pointer_depth})"
+            
+            try:
+                current_value = self.sbvalue.Dereference()
+                if current_value.GetError().Fail():
+                    return f"Error dereferencing pointer: {current_value.GetError().GetCString()}"
+                current_value = DebugValue(current_value, self.KNOWN_ERRORS, self.depth + 1)
+            except Exception as e:
+                return f"Unexpected error while dereferencing pointer: {str(e)}"
+
+        dereferenced_value = current_value
+        return f"Pointer (depth: {pointer_depth}) to {dereferenced_value.get_value()}"
+
+    def _get_composite_value(self):
+        if self.get_num_children() > 0:
+            children = []
+            for i in range(self.sbvalue.GetNumChildren()):
+                child_sbvalue = self.sbvalue.GetChildAtIndex(i)
+                if child_sbvalue.GetName() is not None:
+                    child_debug_value = DebugValue(child_sbvalue, self.KNOWN_ERRORS, self.depth + 1)
+                    children.append(f"{child_debug_value.name}: {child_debug_value.get_value()}")
+            return f"{{{', '.join(children)}}}"
+        else:
+            return self.sbvalue.GetValue()
+        
+    def is_known_error(self) -> bool:
+        """
+        Check if the DebugValue instance contains any of the predefined errors.
+        
+        Returns:
+            bool: True if any of the predefined errors are found in the error_message, False otherwise.
+        """
+        return any(error.lower() in self.error_message.lower() for error in self.ERRORS)
+
+# # def get_debug_values(source_file, binary_file, line_number):
+#     lldb = load_lldb_interface()
+#     debugger = lldb.SBDebugger.Create()
+#     debugger.SetAsync(False)
+#     debugger.SetErrorFileHandle(open(os.devnull, 'w'), False)
+#     target = debugger.CreateTargetWithFileAndArch(binary_file, "arm64")  # lldb.LLDB_ARCH_DEFAULT; arm64 - run on arm64 - apple silicon; x86_64 - run on x86_64 - intel cpu
+#     bp = target.BreakpointCreateByLocation(os.path.basename(source_file), line_number)
+#     process = target.LaunchSimple(None, None, os.getcwd())
+#     thread = process.GetSelectedThread()
+#     frame = thread.GetSelectedFrame()
+#     sbv_list = frame.GetVariables(True, True, True, True)
+#     debug_values = [DebugValue(sbv) for sbv in sbv_list]
+#     # debug_values = []
+#     # for sbv in sbv_list:
+#     #     # print(f"before: {sbv}")
+#     #     debug_values.append(DebugValue(sbv))
+#     #     # print(f"after: {DebugValue(sbv)}")
+    
+    # return debug_values
+
+def get_debug_values(source_file: str, binary_file: str, line_number: int) -> List[DebugValue]:
+    """
+    Get debug values for a specific line in a source file using LLDB.
+
+    Args:
+        source_file (str): Path to the source file.
+        binary_file (str): Path to the compiled binary file.
+        line_number (int): Line number to set the breakpoint.
+
+    Returns:
+        List[DebugValue]: A list of DebugValue objects representing variables at the breakpoint.
+    """
+    lldb = load_lldb_interface()
+    debugger = lldb.SBDebugger.Create()
+    debugger.SetAsync(False)
+
+    # Suppress LLDB output
+    devnull = open(os.devnull, 'w')
+    debugger.SetOutputFileHandle(devnull, False)
+    debugger.SetErrorFileHandle(devnull, False)
+
+    try:
+        target = debugger.CreateTargetWithFileAndArch(binary_file, lldb.LLDB_ARCH_DEFAULT)
+        if not target:
+            raise RuntimeError(f"Failed to create target for {binary_file}")
+
+        bp = target.BreakpointCreateByLocation(os.path.basename(source_file), line_number)
+        if not bp or bp.GetNumLocations() == 0:
+            raise RuntimeError(f"Failed to set breakpoint in {source_file} at line {line_number}")
+
+        process = target.LaunchSimple(None, None, os.getcwd())
+        if not process:
+            raise RuntimeError(f"Failed to launch process for {binary_file}")
+
+        if process.GetState() != lldb.eStateStopped:
+            raise RuntimeError("Process is not in stopped state")
+
+        thread = process.GetSelectedThread()
+        frame = thread.GetSelectedFrame()
+        if not frame:
+            raise RuntimeError("No valid frame found")
+
+        variables = frame.GetVariables(True, True, True, True)
+        debug_values = [DebugValue(var) for var in variables]
+
+        return debug_values
+
+    except Exception as e:
+        print(f"Error in get_debug_values: {str(e)}")
+        return []
+
+    finally:
+        if 'process' in locals() and process.IsValid():
+            process.Kill()
+        if 'target' in locals() and target.IsValid():
+            debugger.DeleteTarget(target)
+        lldb.SBDebugger.Destroy(debugger)
+        devnull.close()
+ 
+if __name__ == '__main__':
+    source_file = sys.argv[1]
+    binary_file = sys.argv[2]
+    line_number = int(sys.argv[3])
+    # debug_values1 = get_debug_values(source_file, binary_file, 31)
+    # debug_values2 = get_debug_values(source_file, binary_file, 35)
+    # debug_dict1 = {value.name: value for value in debug_values1}
+    # debug_dict2 = {value.name: value for value in debug_values2}
+    # common_names = set(debug_dict1.keys()) & set(debug_dict2.keys())
+    # for name in common_names:
+    #     debug_value1 = debug_dict1[name]
+    #     debug_value2 = debug_dict2[name]
+    #     diff = debug_value1.compare(debug_value2)
+    #     if diff:
+    #         print(f"Diff: {binary_file}  {line_number} {debug_value1.name} {diff}")
+    #     else:
+    #         print(f"Same: {binary_file}  {line_number} {debug_value1.name}")
+    line_nums = get_line_nums(source_file, binary_file)
+    for line_number in line_nums:
+        debug_values = get_debug_values(source_file, binary_file, line_number)
+        for debug_value in debug_values:
+            if debug_value.is_pointer() and debug_value.error_message:
+                print(f"{debug_value}")
+
+    #     print(f"selfdefine.get_value(): {debug_value.get_value()}")
